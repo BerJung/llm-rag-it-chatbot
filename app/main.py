@@ -1,9 +1,11 @@
+import httpx
+
 import time
 import logging
 from datetime import datetime
 from typing import Optional, Literal
 
-from fastapi import FastAPI, HTTPException, Form
+from fastapi import FastAPI, HTTPException, Form, BackgroundTasks
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 from openai import OpenAI
@@ -143,6 +145,38 @@ def generate_chat_reply(request: ChatRequest) -> ChatResponse:
     )
 
 
+def send_slack_delayed_response(text: str, user_id: str, response_url: str):
+    """
+    Slack Slash Command에서 받은 요청을 백그라운드에서 처리하고,
+    response_url로 최종 답변을 보내는 함수.
+    """
+    try:
+        req = ChatRequest(
+            message=text,
+            user_id=user_id,
+            channel="slack",
+            use_rag=True,
+        )
+        resp = generate_chat_reply(req)
+
+        payload = {
+            "response_type": "ephemeral",  # 또는 "in_channel"
+            "text": resp.reply,
+        }
+
+        # Slack response_url로 POST
+        with httpx.Client(timeout=10.0) as client:
+            client.post(response_url, json=payload)
+
+        logger.info(
+            "Slack delayed response 전송 완료: user_id=%s len_reply=%d",
+            user_id,
+            len(resp.reply),
+        )
+    except Exception as e:
+        logger.exception("Slack delayed response 전송 중 오류: %s", e)
+
+
 @app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest):
     return generate_chat_reply(request)
@@ -150,15 +184,24 @@ def chat(request: ChatRequest):
 
 @app.post("/slack/slash", response_class=PlainTextResponse)
 def slack_slash(
+    background_tasks: BackgroundTasks,
     text: str = Form(...),
     user_id: str = Form(None),
+    response_url: str = Form(None),
 ):
+    """
+    Slack Slash Command 엔드포인트.
+    - 3초 안에 즉시 확인 메시지 반환 (타임아웃 방지)
+    - 실제 RAG + LLM 처리는 백그라운드에서 실행 후 response_url로 전송
+    """
     logger.info("Slack Slash 호출: user_id=%s text_preview=%s", user_id, text[:80])
-    req = ChatRequest(
-        message=text,
-        user_id=user_id,
-        channel="slack",
-        use_rag=True,
-    )
-    resp = generate_chat_reply(req)
-    return resp.reply
+    
+    if not response_url:
+        logger.warning("Slack 요청에 response_url이 없습니다. 즉시 응답만 반환합니다.")
+        return "요청을 받았지만, 응답 URL이 없어 바로 처리할 수 없습니다."
+
+    # ✅ 백그라운드 작업 등록: 여기서 LLM + RAG 실행 후 response_url로 결과 POST
+    background_tasks.add_task(send_slack_delayed_response, text, user_id, response_url)
+
+    # ✅ Slack 타임아웃을 피하기 위한 즉시 응답 (3초 안에 반환)
+    return "질문을 처리 중입니다. 잠시만 기다려 주세요."
